@@ -1,6 +1,3 @@
-.idea/
-
-
 # Prerequisites
 *.d
 
@@ -42,3 +39,35 @@
 
 # debug information files
 *.dwo
+
+# JetBrains IDE
+.idea/
+
+# CMake build directories
+cmake-build-*/
+
+# Code signing certificates (NEVER commit these!)
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+secrets.txt
+
+# Installer build artifacts
+installer/
+packaging/SpectralShift*.pkg
+*.dmg
+
+# CI/CD artifacts
+artifacts/
+Builds/
+build/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Keychain files
+*.keychain
+*.keychain-db
