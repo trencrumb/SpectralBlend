@@ -7,37 +7,33 @@
 */
 
 #include "PluginProcessor.h"
-#include "PluginEditor.h"
 
 //==============================================================================
-PluginTemplateAudioProcessor::PluginTemplateAudioProcessor()
+SpectralBlendAudioProcessor::SpectralBlendAudioProcessor()
 #ifndef JucePlugin_PreferredChannelConfigurations
      : AudioProcessor (BusesProperties()
-                     #if ! JucePlugin_IsMidiEffect
-                      #if ! JucePlugin_IsSynth
-                       .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                      #endif
+                       // 4 input channels: Source A (L/R) + Source B (L/R)
+                       .withInput  ("Input",  juce::AudioChannelSet::quadraphonic(), true)
+                       // Stereo output: blended result
                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
-
-                     #endif
-                       ), apvts(*this, nullptr, "Parameters", createParameters())
+                       ),
+       apvts(*this, nullptr, "Parameters", createParameters())
 #endif
 {
-    apvts.state.addListener(this); // [2] Add this too!
-    init();
+    apvts.state.addListener(this);
 }
 
-PluginTemplateAudioProcessor::~PluginTemplateAudioProcessor()
+SpectralBlendAudioProcessor::~SpectralBlendAudioProcessor()
 {
 }
 
 //==============================================================================
-const juce::String PluginTemplateAudioProcessor::getName() const
+const juce::String SpectralBlendAudioProcessor::getName() const
 {
     return JucePlugin_Name;
 }
 
-bool PluginTemplateAudioProcessor::acceptsMidi() const
+bool SpectralBlendAudioProcessor::acceptsMidi() const
 {
    #if JucePlugin_WantsMidiInput
     return true;
@@ -46,7 +42,7 @@ bool PluginTemplateAudioProcessor::acceptsMidi() const
    #endif
 }
 
-bool PluginTemplateAudioProcessor::producesMidi() const
+bool SpectralBlendAudioProcessor::producesMidi() const
 {
    #if JucePlugin_ProducesMidiOutput
     return true;
@@ -55,7 +51,7 @@ bool PluginTemplateAudioProcessor::producesMidi() const
    #endif
 }
 
-bool PluginTemplateAudioProcessor::isMidiEffect() const
+bool SpectralBlendAudioProcessor::isMidiEffect() const
 {
    #if JucePlugin_IsMidiEffect
     return true;
@@ -64,202 +60,359 @@ bool PluginTemplateAudioProcessor::isMidiEffect() const
    #endif
 }
 
-double PluginTemplateAudioProcessor::getTailLengthSeconds() const
+double SpectralBlendAudioProcessor::getTailLengthSeconds() const
 {
-    return 0.0;
+    return static_cast<double>(currentFFTSize) / currentSampleRate;
 }
 
-int PluginTemplateAudioProcessor::getNumPrograms()
+int SpectralBlendAudioProcessor::getNumPrograms()
 {
-    return 1;   // NB: some hosts don't cope very well if you tell them there are 0 programs,
-                // so this should be at least 1, even if you're not really implementing programs.
+    return 1;
 }
 
-int PluginTemplateAudioProcessor::getCurrentProgram()
+int SpectralBlendAudioProcessor::getCurrentProgram()
 {
     return 0;
 }
 
-void PluginTemplateAudioProcessor::setCurrentProgram (int index)
+void SpectralBlendAudioProcessor::setCurrentProgram (int index)
 {
+    juce::ignoreUnused(index);
 }
 
-const juce::String PluginTemplateAudioProcessor::getProgramName (int index)
+const juce::String SpectralBlendAudioProcessor::getProgramName (int index)
 {
+    juce::ignoreUnused(index);
     return {};
 }
 
-void PluginTemplateAudioProcessor::changeProgramName (int index, const juce::String& newName)
+void SpectralBlendAudioProcessor::changeProgramName (int index, const juce::String& newName)
 {
+    juce::ignoreUnused(index, newName);
 }
 
 //==============================================================================
-void PluginTemplateAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+void SpectralBlendAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
+    juce::ignoreUnused(samplesPerBlock);
+
+    currentSampleRate = sampleRate;
     isActive = true;
-    prepare(sampleRate, samplesPerBlock);
-    update();
-    reset();
+
+    // Get FFT size from parameter (choice index: 0=512, 1=1024, 2=2048, 3=4096)
+    auto fftSizeParam = apvts.getRawParameterValue("FFT_SIZE");
+    int fftSizeIndex = static_cast<int>(fftSizeParam->load());
+    static const int fftSizes[] = {512, 1024, 2048, 4096};
+    currentFFTSize = fftSizes[std::clamp(fftSizeIndex, 0, 3)];
+    currentWindowSize = currentFFTSize;
+    currentHopSize = currentFFTSize / kDefaultHopDivisor;
+
+    initSpectralProcessing();
+
+    // Initialize smoothed values
+    blendValue.reset(sampleRate, 0.05);  // 50ms smoothing
+    outputGain.reset(sampleRate, 0.05);
+
+    updateParameters();
 }
 
-void PluginTemplateAudioProcessor::releaseResources()
+void SpectralBlendAudioProcessor::initSpectralProcessing()
 {
-    // When playback stops, you can use this as an opportunity to free up any
-    // spare memory, etc.
+    // Create AudioTransport instances with the actual FFT size we'll use
+    // Note: AudioTransport has a bug in init() when using sizes different from constructor
+    fluid::Allocator& alloc = fluid::FluidDefaultAllocator();
+
+    audioTransportL = std::make_unique<fluid::algorithm::AudioTransport>(currentFFTSize, alloc);
+    audioTransportR = std::make_unique<fluid::algorithm::AudioTransport>(currentFFTSize, alloc);
+
+    // Initialize the AudioTransport algorithms
+    audioTransportL->init(currentWindowSize, currentFFTSize, currentHopSize);
+    audioTransportR->init(currentWindowSize, currentFFTSize, currentHopSize);
+
+    // Size the ring buffers - need at least 2x FFT size for overlap-add
+    const int bufferSize = currentFFTSize * 4;
+
+    for (auto& buf : inputBuffers)
+    {
+        buf.resize(static_cast<size_t>(bufferSize), 0.0);
+    }
+
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        outputBuffers[static_cast<size_t>(ch)].resize(static_cast<size_t>(bufferSize), 0.0);
+        windowAccumulator[static_cast<size_t>(ch)].resize(static_cast<size_t>(bufferSize), 0.0);
+    }
+
+    // Reset positions
+    inputWritePos = 0;
+    outputWritePos = currentFFTSize;  // Start output ahead by one FFT frame for latency compensation
+    outputReadPos = 0;
+
+    // Wait until we have accumulated at least one full window before processing
+    samplesUntilNextHop = currentWindowSize;
+
+    // Clear all buffers
+    for (auto& buf : inputBuffers)
+    {
+        std::fill(buf.begin(), buf.end(), 0.0);
+    }
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        std::fill(outputBuffers[static_cast<size_t>(ch)].begin(),
+                  outputBuffers[static_cast<size_t>(ch)].end(), 0.0);
+        std::fill(windowAccumulator[static_cast<size_t>(ch)].begin(),
+                  windowAccumulator[static_cast<size_t>(ch)].end(), 0.0);
+    }
+}
+
+void SpectralBlendAudioProcessor::releaseResources()
+{
+    audioTransportL.reset();
+    audioTransportR.reset();
 }
 
 #ifndef JucePlugin_PreferredChannelConfigurations
-bool PluginTemplateAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+bool SpectralBlendAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-  #if JucePlugin_IsMidiEffect
-    juce::ignoreUnused (layouts);
-    return true;
-  #else
-    // This is the place where you check if the layout is supported.
-    // In this template code we only support mono or stereo.
-    // Some plugin hosts, such as certain GarageBand versions, will only
-    // load plugins that support stereo bus layouts.
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-     && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+    // We need exactly 4 input channels and 2 output channels
+    if (layouts.getMainInputChannelSet() != juce::AudioChannelSet::quadraphonic())
         return false;
 
-    // This checks if the input layout matches the output layout
-   #if ! JucePlugin_IsSynth
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
+    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
         return false;
-   #endif
 
     return true;
-  #endif
 }
 #endif
 
-void PluginTemplateAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+void SpectralBlendAudioProcessor::updateParameters()
 {
+    auto blend = apvts.getRawParameterValue("BLEND");
+    auto gain = apvts.getRawParameterValue("OUTPUT_GAIN");
+
+    blendValue.setTargetValue(blend->load());
+    outputGain.setTargetValue(juce::Decibels::decibelsToGain(gain->load()));
+
+    mustUpdateProcessing = false;
+}
+
+void SpectralBlendAudioProcessor::processSpectralFrame()
+{
+    if (!audioTransportL || !audioTransportR || !audioTransportL->initialized())
+        return;
+
+    fluid::Allocator& alloc = fluid::FluidDefaultAllocator();
+
+    const int bufferSize = static_cast<int>(inputBuffers[0].size());
+
+    // Calculate the read position for the frame (one window back from write position)
+    int frameStart = (inputWritePos - currentWindowSize + bufferSize) % bufferSize;
+
+    // Create FluidTensor views for the input frames - use the allocator
+    fluid::index windowSize = static_cast<fluid::index>(currentWindowSize);
+    fluid::RealVector frameA_L(windowSize, alloc);
+    fluid::RealVector frameA_R(windowSize, alloc);
+    fluid::RealVector frameB_L(windowSize, alloc);
+    fluid::RealVector frameB_R(windowSize, alloc);
+
+    // Copy data from ring buffers to frame buffers
+    for (int i = 0; i < currentWindowSize; ++i)
+    {
+        int idx = (frameStart + i) % bufferSize;
+        frameA_L(i) = inputBuffers[0][static_cast<size_t>(idx)];
+        frameA_R(i) = inputBuffers[1][static_cast<size_t>(idx)];
+        frameB_L(i) = inputBuffers[2][static_cast<size_t>(idx)];
+        frameB_R(i) = inputBuffers[3][static_cast<size_t>(idx)];
+    }
+
+    // Output is 2 rows: [0] = audio output, [1] = window squared (for normalization)
+    fluid::RealMatrix outputL(2, windowSize, alloc);
+    fluid::RealMatrix outputR(2, windowSize, alloc);
+
+    // Initialize output matrices to zero
+    for (fluid::index r = 0; r < 2; ++r)
+    {
+        for (fluid::index c = 0; c < windowSize; ++c)
+        {
+            outputL(r, c) = 0.0;
+            outputR(r, c) = 0.0;
+        }
+    }
+
+    // Get current blend value
+    double blend = static_cast<double>(blendValue.getCurrentValue());
+
+    // Process frames through AudioTransport
+    audioTransportL->processFrame(frameA_L, frameB_L, blend, outputL, alloc);
+    audioTransportR->processFrame(frameA_R, frameB_R, blend, outputR, alloc);
+
+    // Overlap-add the output
+    for (int i = 0; i < currentWindowSize; ++i)
+    {
+        int outIdx = (outputWritePos + i) % bufferSize;
+
+        outputBuffers[0][static_cast<size_t>(outIdx)] += outputL(0, i);
+        outputBuffers[1][static_cast<size_t>(outIdx)] += outputR(0, i);
+
+        windowAccumulator[0][static_cast<size_t>(outIdx)] += outputL(1, i);
+        windowAccumulator[1][static_cast<size_t>(outIdx)] += outputR(1, i);
+    }
+
+    // Advance output write position by hop size
+    outputWritePos = (outputWritePos + currentHopSize) % bufferSize;
+}
+
+void SpectralBlendAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+{
+    juce::ignoreUnused(midiMessages);
+
     if (!isActive)
         return;
 
     if (mustUpdateProcessing)
-        update();
+        updateParameters();
 
     juce::ScopedNoDenormals noDenormals;
 
-    // ...rest of your processing (distortion, volume, mix, etc.)...
-}
+    const int numInputChannels = getTotalNumInputChannels();
+    const int numOutputChannels = getTotalNumOutputChannels();
+    const int numSamples = buffer.getNumSamples();
 
+    // Need at least 4 input channels
+    if (numInputChannels < 4)
+    {
+        buffer.clear();
+        return;
+    }
+
+    const int bufferSize = static_cast<int>(inputBuffers[0].size());
+
+    // Get input channel pointers
+    const float* inputA_L = buffer.getReadPointer(0);
+    const float* inputA_R = buffer.getReadPointer(1);
+    const float* inputB_L = buffer.getReadPointer(2);
+    const float* inputB_R = buffer.getReadPointer(3);
+
+    // Get output channel pointers
+    float* outputL = buffer.getWritePointer(0);
+    float* outputR = numOutputChannels > 1 ? buffer.getWritePointer(1) : buffer.getWritePointer(0);
+
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        // Write input samples to ring buffers
+        inputBuffers[0][static_cast<size_t>(inputWritePos)] = static_cast<double>(inputA_L[sample]);
+        inputBuffers[1][static_cast<size_t>(inputWritePos)] = static_cast<double>(inputA_R[sample]);
+        inputBuffers[2][static_cast<size_t>(inputWritePos)] = static_cast<double>(inputB_L[sample]);
+        inputBuffers[3][static_cast<size_t>(inputWritePos)] = static_cast<double>(inputB_R[sample]);
+
+        inputWritePos = (inputWritePos + 1) % bufferSize;
+
+        // Process a frame when we've accumulated enough samples
+        samplesUntilNextHop--;
+        if (samplesUntilNextHop <= 0)
+        {
+            processSpectralFrame();
+            samplesUntilNextHop = currentHopSize;
+
+            // Update blend value for next frame
+            blendValue.skip(currentHopSize);
+        }
+
+        // Read from output buffer with normalization
+        double outL = 0.0;
+        double outR = 0.0;
+
+        double normL = windowAccumulator[0][static_cast<size_t>(outputReadPos)];
+        double normR = windowAccumulator[1][static_cast<size_t>(outputReadPos)];
+
+        constexpr double minNorm = 1e-10;
+
+        if (normL > minNorm)
+            outL = outputBuffers[0][static_cast<size_t>(outputReadPos)] / normL;
+        if (normR > minNorm)
+            outR = outputBuffers[1][static_cast<size_t>(outputReadPos)] / normR;
+
+        // Clear the output buffer position for reuse
+        outputBuffers[0][static_cast<size_t>(outputReadPos)] = 0.0;
+        outputBuffers[1][static_cast<size_t>(outputReadPos)] = 0.0;
+        windowAccumulator[0][static_cast<size_t>(outputReadPos)] = 0.0;
+        windowAccumulator[1][static_cast<size_t>(outputReadPos)] = 0.0;
+
+        outputReadPos = (outputReadPos + 1) % bufferSize;
+
+        // Apply output gain
+        float gain = outputGain.getNextValue();
+        outputL[sample] = static_cast<float>(outL) * gain;
+        outputR[sample] = static_cast<float>(outR) * gain;
+    }
+}
 
 //==============================================================================
-bool PluginTemplateAudioProcessor::hasEditor() const
+bool SpectralBlendAudioProcessor::hasEditor() const
 {
-    return true; // (change this to false if you choose to not supply an editor)
+    return true;
 }
 
-juce::AudioProcessorEditor* PluginTemplateAudioProcessor::createEditor()
+juce::AudioProcessorEditor* SpectralBlendAudioProcessor::createEditor()
 {
-    return new PluginTemplateAudioProcessorEditor (*this);
-    //return new juce::GenericAudioProcessorEditor(*this);
+    return new juce::GenericAudioProcessorEditor (*this);
+    //return new SpectralBlendAudioProcessorEditor(*this);
 }
 
 //==============================================================================
-void PluginTemplateAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+void SpectralBlendAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    // You should use this method to store your parameters in the memory block.
-    // You could do that either as raw data, or use the XML or ValueTree classes
-    // as intermediaries to make it easy to save and load complex data.
-
-    // Create a temporary ValueTree object called copyState and assign it the value returned by apvts.copyState();
     juce::ValueTree copyState = apvts.copyState();
-
-    // Create a unique_ptr to copy XML information
     std::unique_ptr<juce::XmlElement> xml = copyState.createXml();
-
-    // Copy XML that we just created to our binary (Our Memory block)
     copyXmlToBinary(*xml.get(), destData);
 }
 
-void PluginTemplateAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void SpectralBlendAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    // You should use this method to restore your parameters from this memory block,
-    // whose contents will have been created by the getStateInformation() call.
-
-    // Create an xml pointer, and get the XML from the binary (our memory block)
     std::unique_ptr<juce::XmlElement> xml = getXmlFromBinary(data, sizeInBytes);
-
-    // Create a temporary ValueTree called copyState and save that data into our ValueTree object
-    juce::ValueTree copyState = juce::ValueTree::fromXml(*xml.get());
-
-    // Now we will replace the state with our copyState object in our apvts object
-    apvts.replaceState(copyState);
-}
-
-void PluginTemplateAudioProcessor::init()
-{
-}
-
-void PluginTemplateAudioProcessor::prepare(double sampleRate, int samplesPerBlock)
-{
-}
-
-void PluginTemplateAudioProcessor::update()
-{
-    mustUpdateProcessing = false;
-
-    //Load variables from APVTS
-    auto drive = apvts.getRawParameterValue("DRIVE");
-    auto volume = apvts.getRawParameterValue("VOL");
-    auto mix = apvts.getRawParameterValue("MIX");
-
-    driveNormal = drive->load();
-
-    for (int channel = 0; channel < 2; ++channel)
+    if (xml)
     {
-        outputVolume[channel].setTargetValue(juce::Decibels::decibelsToGain(volume->load()));
-        outputMix[channel].setTargetValue(mix->load());
-    }
-
-}
-
-void PluginTemplateAudioProcessor::reset()
-{
-    driveNormal.reset(getSampleRate(), 0.050);
-
-    for (int channel = 0; channel < 2; ++channel)
-    {
-        // reset(sampleRate, rampLength in seconds)
-        outputVolume[channel].reset(getSampleRate(), 0.001);
-        outputMix[channel].reset(getSampleRate(), 0.001);
+        juce::ValueTree copyState = juce::ValueTree::fromXml(*xml.get());
+        apvts.replaceState(copyState);
     }
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout PluginTemplateAudioProcessor::createParameters()
+juce::AudioProcessorValueTreeState::ParameterLayout SpectralBlendAudioProcessor::createParameters()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> parameters;
 
-    // Creates a function takes floats/ints and returns a string
-    std::function<juce::String(float, int)> valueToTextFunction = [](float x, int l) { return juce::String(x, 4); };
+    // Blend parameter: 0 = 100% Source A, 1 = 100% Source B
+    parameters.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "BLEND", "Blend",
+        juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
+        0.5f,
+        juce::String(),
+        juce::AudioProcessorParameter::genericParameter,
+        [](float value, int) { return juce::String(static_cast<int>(value * 100)) + "%"; },
+        [](const juce::String& text) { return text.getFloatValue() / 100.0f; }
+    ));
 
-    // Creates a function that takes a String and returns a float
-    std::function<float(const juce::String&)> textToValueFunction = [](const juce::String& str) { return str.getFloatValue(); };
+    // Output gain in dB
+    // Output gain in dB
+    parameters.push_back(std::make_unique<juce::AudioParameterFloat>(
+        "OUTPUT_GAIN", "Output Gain",
+        juce::NormalisableRange<float>(-24.0f, 12.0f, 0.1f),
+        0.0f,
+        "dB"
+    ));
 
-    // Add a Drive Parameter to our vector of parameters
-    parameters.push_back(std::make_unique<juce::AudioParameterFloat>("DRIVE", "Drive", juce::NormalisableRange<float>(0.0f, 100.0f, 0.1f), 20.0f, "%", juce::AudioProcessorParameter::genericParameter, valueToTextFunction, textToValueFunction));
-
-    // Add a Volume Parameter to our vector of parameters
-    parameters.push_back(std::make_unique<juce::AudioParameterFloat>("VOL", "Volume", juce::NormalisableRange<float>(-40.0f, 40.0f), 0.0f, "db", 
-        juce::AudioProcessorParameter::genericParameter, valueToTextFunction, textToValueFunction));
-
-    // Add a Wet/Dry Parameter to our vector of parameters
-    parameters.push_back(std::make_unique<juce::AudioParameterFloat>("MIX", "Mix", juce::NormalisableRange<float>(0.0f, 100.0f, 0.5f), 0.0f, "%",
-        juce::AudioProcessorParameter::genericParameter, valueToTextFunction, textToValueFunction));
-
-
+    // FFT Size parameter
+    parameters.push_back(std::make_unique<juce::AudioParameterChoice>(
+        "FFT_SIZE", "FFT Size",
+        juce::StringArray{"512", "1024", "2048", "4096"},
+        1  // Default to 1024
+    ));
 
     return { parameters.begin(), parameters.end() };
 }
 
 //==============================================================================
-// This creates new instances of the plugin..
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new PluginTemplateAudioProcessor();
+    return new SpectralBlendAudioProcessor();
 }

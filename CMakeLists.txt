@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 
 # Change to your project name
-project(PluginTemplate VERSION 0.0.1)
+project(SpectralBlend VERSION 0.0.1)
+set(COMPANY_NAME "trencrumb")
+set(PRODUCT_NAME "Spectral Blend")
 
 
 set(CMAKE_CXX_STANDARD 20)
@@ -27,28 +29,39 @@ CPMAddPackage(
     GIT_TAG origin/master
 )
 
+CPMAddPackage(
+        NAME clap_juce_extensions
+        GIT_REPOSITORY https://github.com/free-audio/clap-juce-extensions.git
+        GIT_TAG origin/main
+)
+
+CPMAddPackage(
+        name flucoma-core
+        GIT_REPOSITORY https://github.com/flucoma/flucoma-core.git
+        GIT_TAG origin/main
+)
+
 # Make sure you include any new source files here
 set(SourceFiles
-        Source/PluginEditor.cpp
-        Source/PluginEditor.h
         Source/PluginProcessor.cpp
         Source/PluginProcessor.h
 )
 
 # Change these to your own preferences
 juce_add_plugin(${PROJECT_NAME}
-        COMPANY_NAME trencrumb
+        COMPANY_NAME ${COMPANY_NAME}
         IS_SYNTH FALSE
         NEEDS_MIDI_INPUT FALSE
         NEEDS_MIDI_OUTPUT FALSE
         IS_MIDI_EFFECT FALSE
+        LV2URI "http://github.com/trencrumb/SpectralBlend"
         EDITOR_WANTS_KEYBOARD_FOCUS FALSE
         JUCE_VST3_CAN_REPLACE_VST2 FALSE
         COPY_PLUGIN_AFTER_BUILD TRUE
         PLUGIN_MANUFACTURER_CODE TreC
-        PLUGIN_CODE Reg0
-        FORMATS VST3 AU Standalone
-        PRODUCT_NAME "PluginTemplate"
+        PLUGIN_CODE SpBl
+        FORMATS VST3 AU LV2 AAX Standalone
+        PRODUCT_NAME ${PRODUCT_NAME}
 )
 
 # How we want our SourceFiles to appear in our IDE
@@ -68,6 +81,7 @@ target_compile_definitions(${PROJECT_NAME}
 # JUCE libraries to bring into our project
 target_link_libraries(${PROJECT_NAME}
         PUBLIC
+        FLUID_DECOMPOSITION
         juce::juce_analytics
         juce::juce_audio_basics
         juce::juce_audio_devices
@@ -82,4 +96,9 @@ target_link_libraries(${PROJECT_NAME}
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+clap_juce_extensions_plugin(TARGET ${PROJECT_NAME}
+        CLAP_ID "com.${COMPANY_NAME}.${PROJECT_NAME}"
+        CLAP_FEATURES "audio-effect")
+add_dependencies(${PROJECT_NAME}_All ${PROJECT_NAME}_CLAP)
 
